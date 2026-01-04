@@ -75,6 +75,7 @@ src-git libcamera https://github.com/nicholasbalasus/openwrt-feed-libcamera.git
 | Version format | `v0.5.1` | `0.5.1` | OpenWrt naming convention |
 | Build depends | `openssl` | `openssl`, `libevent2` | libevent2 required for `cam` utility event loop |
 | Runtime depends | `libyaml`, `libgnutls`, `libstdcpp` | + `libudev-zero`, `libevent2`, `libevent2-pthreads` | libevent2-pthreads for threaded event dispatcher |
+| Runtime depends | (none) | + `libdrm` | Required by VC4 pipeline for DRM buffer sharing with GPU |
 | Runtime depends | (none) | + conditional `gst1-plugins-base`, `gstreamer1-libs` | Only when `CONFIG_LIBCAMERA_GSTREAMER_SUPPORT=y` |
 | cam utility | disabled | **enabled** (`-Dcam=enabled`) | Debugging tool, also used for pipe-to-ffmpeg workaround |
 | strip | (default) | `false` (`-Dstrip=false`) | Prevents IPA module corruption (see below) |
