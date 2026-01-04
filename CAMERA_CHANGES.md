@@ -827,3 +827,148 @@ chmod +x /etc/init.d/camera-stream
 - [ ] Power optimization for travel use
 - [ ] Automatic WireGuard reconnection
 - [ ] Camera stream health monitoring
+
+---
+
+## Known Issue: Kernel Crash on Early FFmpeg Exit (UNDER INVESTIGATION)
+
+### Symptom
+
+When ffmpeg with `h264_v4l2m2m` encoder exits early (before streaming starts), the system experiences a **kernel panic and reboots**. This happens specifically when:
+
+- Connection is refused (e.g., `rtsp://localhost:9999/test` with nothing listening)
+- Authentication fails (401 Unauthorized before MediaMTX is configured)
+- Any error that causes ffmpeg to exit before the encoder pipeline is established
+
+**What does NOT crash:**
+- Ctrl+C during active streaming (graceful shutdown)
+- Broken pipe mid-stream (MediaMTX killed while streaming)
+- Using `-c:v copy` (no hardware encoder) with the same connection failure
+
+### Suspected Root Cause
+
+Based on source code analysis of `bcm2835-v4l2-codec.c` and `mmal-vchiq.c`:
+
+**Use-after-free race condition in VPU buffer cleanup:**
+
+1. `bcm2835_codec_stop_streaming()` calls `bcm2835_codec_flush_buffers()`
+2. `flush_buffers()` waits up to **2 seconds** (`COMPLETE_TIMEOUT = 2 * HZ`) for VPU to return buffers
+3. If timeout expires, cleanup continues anyway - buffers, context, and port structures are freed
+4. VPU eventually finishes and calls `buffer_work_cb()` via workqueue
+5. `buffer_work_cb()` tries to call `port->buffer_cb()` on **already-freed memory**
+6. Kernel panic (use-after-free)
+
+**Key code locations:**
+
+```c
+// bcm2835-v4l2-codec.c:3026-3042
+static void bcm2835_codec_flush_buffers(struct bcm2835_codec_ctx *ctx,
+                                        struct vchiq_mmal_port *port)
+{
+    if (atomic_read(&port->buffers_with_vpu)) {
+        ret = wait_for_completion_timeout(&ctx->frame_cmplt,
+                                          COMPLETE_TIMEOUT);  // 2 seconds
+        if (ret <= 0) {
+            v4l2_err(..., "Timeout waiting for buffers to be returned - %d outstanding\n",
+                     atomic_read(&port->buffers_with_vpu));
+            // BUG: Cleanup continues despite outstanding buffers!
+        }
+    }
+}
+
+// mmal-vchiq.c:254-282
+static void buffer_work_cb(struct work_struct *work)
+{
+    // Called asynchronously by VPU via workqueue
+    // If ctx/port already freed, this crashes:
+    msg_context->u.bulk.port->buffer_cb(...);  // USE-AFTER-FREE
+}
+```
+
+**Why early exit triggers this:**
+- When ffmpeg fails before streaming starts, the encoder context is torn down rapidly
+- VPU may have received setup commands but not yet responded
+- The 2-second timeout is insufficient when VPU is in an unexpected state
+- Cleanup proceeds, VPU responds late, crash
+
+### Related Upstream Issues (All OPEN, No Fix)
+
+These GitHub issues describe the same or very similar buffer timeout problems:
+
+| Issue | Description | Status |
+|-------|-------------|--------|
+| [raspberrypi/linux#4592](https://github.com/raspberrypi/linux/issues/4592) | v4l2h264dec hangs with "Timeout waiting for buffers to be returned - 6 outstanding" | **Open** |
+| [raspberrypi/linux#4606](https://github.com/raspberrypi/linux/issues/4606) | Same timeout message, affects small % of Pi 4B devices | **Open** |
+| [raspberrypi/linux#5360](https://github.com/raspberrypi/linux/issues/5360) | "Failed disabling i/p port, ret -62" with FullHD + CBR | **Open** |
+| [raspberrypi/linux#3325](https://github.com/raspberrypi/linux/issues/3325) | Driver leaks buffers, device becomes unstable | **Open** |
+
+Common symptoms across issues:
+- `bcm2835_codec_stop_streaming: Timeout waiting for buffers to be returned`
+- `videobuf2-core.c: driver bug: stop_streaming operation is leaving buf in active state`
+- System instability or crashes after extended use
+
+### Testing Methodology
+
+We performed systematic testing to isolate the crash trigger:
+
+| Test | Command | Result |
+|------|---------|--------|
+| Normal stream + Ctrl+C | ffmpeg ... rtsp://localhost:8554/camera, then Ctrl+C | **No crash** |
+| Broken pipe mid-stream | Kill MediaMTX while streaming | **No crash** |
+| Connection refused | ffmpeg ... rtsp://localhost:9999/test | **CRASH** |
+| 401 Unauthorized | ffmpeg to MediaMTX without auth | **CRASH** |
+| Connection refused + no encoder | ffmpeg -c:v copy ... rtsp://localhost:9999/test | **No crash** |
+
+**Conclusion:** The crash occurs specifically when:
+1. `h264_v4l2m2m` encoder is used AND
+2. ffmpeg exits before streaming pipeline is fully established
+
+### Current Workaround
+
+**Pre-flight check:** Verify MediaMTX is ready before starting ffmpeg.
+
+```bash
+#!/bin/sh
+# /usr/bin/camera-stream.sh
+
+export LD_PRELOAD=/usr/libexec/libcamera/v4l2-compat.so
+
+# Wait for MediaMTX to be ready (prevents crash from early connection failure)
+echo "Waiting for MediaMTX on port 8554..."
+while ! netstat -tln 2>/dev/null | grep -q ':8554'; do
+    sleep 1
+done
+echo "MediaMTX ready, starting stream..."
+
+# Additional delay to ensure MediaMTX is fully initialized
+sleep 2
+
+exec /usr/bin/ffmpeg \
+    -f v4l2 \
+    -video_size 1024x768 \
+    -framerate 15 \
+    -i /dev/video0 \
+    -c:v h264_v4l2m2m \
+    -b:v 1M \
+    -f rtsp \
+    rtsp://localhost:8554/camera
+```
+
+This prevents the crash by ensuring ffmpeg never encounters a connection failure at startup.
+
+### Next Steps (TODO)
+
+1. **Capture actual panic trace** to verify root cause hypothesis
+   - Configure remote syslog: `uci set system.@system[0].log_ip='<laptop>'`
+   - Or enable `CONFIG_NETCONSOLE=y` in kernel and rebuild
+   - Or enable `CONFIG_PSTORE=y` + ramoops for crash persistence
+
+2. **Potential kernel fix** (if root cause confirmed):
+   - Add "flushing" flag to prevent `buffer_work_cb` from accessing freed memory
+   - Extend timeout or implement retry logic
+   - Cancel pending workqueue items before freeing context
+
+3. **Alternative mitigations**:
+   - FIFO intermediary (isolate encoder from network failures)
+   - HLS output instead of RTSP (no persistent connection)
+   - Hardware watchdog for auto-recovery on crash
